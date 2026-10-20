@@ -453,7 +453,7 @@ async fn proxy_handler(
 
         let rewritable = method != "head"
             && status == StatusCode::OK
-            && is_html(&parts.headers)
+            && is_rewritable_text(&parts.headers)
             && !is_content_encoded(&parts.headers);
 
         let mut body = Some(body);
@@ -486,7 +486,10 @@ async fn proxy_handler(
                 }
                 Err(err) => {
                     log_access(peer, StatusCode::BAD_GATEWAY, &method, &path, "-");
-                    log_error("proxy", &format!("read html response for {path}: {err}"));
+                    log_error(
+                        "proxy",
+                        &format!("read rewritable response for {path}: {err}"),
+                    );
                     return StatusCode::BAD_GATEWAY.into_response();
                 }
             }
@@ -636,13 +639,16 @@ fn rewrite_header(
     }
 }
 
-fn is_html(headers: &HeaderMap) -> bool {
+fn is_rewritable_text(headers: &HeaderMap) -> bool {
     headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(|value| {
             let value = value.to_ascii_lowercase();
-            value.starts_with("text/html") || value.starts_with("application/xhtml+xml")
+            value.starts_with("text/html")
+                || value.starts_with("application/xhtml+xml")
+                || value.starts_with("text/css")
+                || value.starts_with("image/svg+xml")
         })
         .unwrap_or(false)
 }
@@ -825,4 +831,74 @@ fn log_access(peer: SocketAddr, status: StatusCode, method: &str, path: &str, by
             status.as_u16()
         ),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rewrites() -> Vec<(String, String)> {
+        rewrite_map(Some("localhost:8443"), 8000, "https://localhost:8443")
+    }
+
+    fn rewrite(input: &str) -> String {
+        let output = rewrite_bytes(input.as_bytes(), &rewrites()).expect("content changed");
+        String::from_utf8(output).expect("utf-8")
+    }
+
+    #[test]
+    fn rewrites_img_and_video_markup() {
+        let html = concat!(
+            r#"<img src="http://127.0.0.1:8000/a.png" "#,
+            r#"srcset="http://localhost:8000/a.png 1x, http://127.0.0.1:8000/b.png 2x">"#,
+            r#"<video poster="http://localhost:8000/p.jpg">"#,
+            r#"<source src="http://127.0.0.1:8000/v.mp4" type="video/mp4">"#,
+            r#"<track src="http://127.0.0.1:8000/c.vtt">"#,
+            r#"</video>"#
+        );
+        let output = rewrite(html);
+
+        assert!(output.contains(r#"src="https://localhost:8443/a.png""#));
+        assert!(output.contains(
+            r#"srcset="https://localhost:8443/a.png 1x, https://localhost:8443/b.png 2x""#
+        ));
+        assert!(output.contains(r#"poster="https://localhost:8443/p.jpg""#));
+        assert!(output.contains(r#"src="https://localhost:8443/v.mp4""#));
+        assert!(output.contains(r#"src="https://localhost:8443/c.vtt""#));
+        assert!(!output.contains("http://"));
+    }
+
+    #[test]
+    fn rewrites_css_media_urls() {
+        let css = concat!(
+            r#"body { background: url(http://127.0.0.1:8000/bg.webp); }"#,
+            r#"video { background-image: url("http://localhost:8000/p.jpg"); }"#
+        );
+        let output = rewrite(css);
+
+        assert!(output.contains("url(https://localhost:8443/bg.webp)"));
+        assert!(output.contains(r#"url("https://localhost:8443/p.jpg")"#));
+        assert!(!output.contains("http://"));
+    }
+
+    #[test]
+    fn rewrites_svg_image_references() {
+        let svg = concat!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg">"#,
+            r#"<image href="http://127.0.0.1:8000/logo.png"/>"#,
+            r#"<image xlink:href="http://localhost:8000/poster.jpg"/>"#,
+            r#"</svg>"#
+        );
+        let output = rewrite(svg);
+
+        assert!(output.contains(r#"href="https://localhost:8443/logo.png""#));
+        assert!(output.contains(r#"xlink:href="https://localhost:8443/poster.jpg""#));
+        assert!(output.contains(r#"xmlns="http://www.w3.org/2000/svg""#));
+    }
+
+    #[test]
+    fn leaves_unrelated_urls_alone() {
+        let html = r#"<img src="https://cdn.example.com/a.png"><a href="http://example.com">x</a>"#;
+        assert!(rewrite_bytes(html.as_bytes(), &rewrites()).is_none());
+    }
 }

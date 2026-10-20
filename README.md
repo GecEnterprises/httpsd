@@ -18,12 +18,13 @@ then open `https://localhost:8443` (or `https://<lan-ip>:8443`).
 
 httpsd rewrites the upstream's `http://` self-references so the page keeps working over https. it handles:
 
-- `text/html` and `application/xhtml+xml` bodies, including `href`, `src`, `action`, `srcset`, inline css `url(...)`, and urls inside inline scripts
+- `text/html` and `application/xhtml+xml` bodies, including `href`, `src`, `action`, `srcset`, `poster`, `<source>`, inline css `url(...)`, and urls inside inline scripts
+- `text/css` stylesheets and `image/svg+xml` documents, so images and videos referenced from css or svg also go through httpsd
 - `location`, `content-location`, `link`, and `refresh` response headers
 
 the upstream origins `http://127.0.0.1:<server-port>`, `http://localhost:<server-port>`, `http://0.0.0.0:<server-port>`, `http://[::1]:<server-port>`, and `http://<request-host>` are replaced with `https://<request-host>`.
 
-rewritten html is cached in memory for five minutes (at most 128 entries / 8 mib per entry). cache keys include the requested host, `origin`, and a hash of `cookie`/`authorization`, so responses are not shared across identities. responses with `set-cookie` or `cache-control: no-store`, `no-cache`, or `private` are not cached. successful non-GET requests clear the cache.
+rewritten html, css, and svg is cached in memory for five minutes (at most 128 entries / 8 mib per entry). cache keys include the requested host, `origin`, and a hash of `cookie`/`authorization`, so responses are not shared across identities. responses with `set-cookie` or `cache-control: no-store`, `no-cache`, or `private` are not cached. successful non-GET requests clear the cache.
 
 ## cors
 
