@@ -13,6 +13,7 @@ axum-server = { version = "0.7", features = ["tls-rustls"] }
 chrono = "0.4"
 dirs = "5"
 hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "native-tokio", "tls12"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
 if-addrs = "0.15"
 rcgen = { version = "0.13", features = ["pem"] }

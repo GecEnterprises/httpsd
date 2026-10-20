@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
@@ -18,6 +19,7 @@ use axum::{
     Router,
 };
 use axum_server::tls_rustls::RustlsConfig;
+use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::{
     client::legacy::{connect::HttpConnector, Client},
     rt::{TokioExecutor, TokioIo},
@@ -34,11 +36,18 @@ const FINGERPRINT_FILE: &str = "fingerprint.txt";
 const BIND_ADDR: Ipv4Addr = Ipv4Addr::UNSPECIFIED;
 const MAX_REWRITE_BODY: usize = 16 * 1024 * 1024;
 const MAX_CACHE_BODY: usize = 8 * 1024 * 1024;
-const MAX_CACHE_ENTRIES: usize = 128;
-const CACHE_TTL: Duration = Duration::from_secs(300);
+const MAX_CACHE_TOTAL: usize = 128 * 1024 * 1024;
+const MAX_CACHE_ENTRIES: usize = 512;
+const UPSTREAM_CACHE_TTL: Duration = Duration::from_secs(300);
+const GATEWAY_CACHE_TTL: Duration = Duration::from_secs(3600);
+/// Everything fetched from a third party is routed through this prefix so the
+/// browser only ever talks to httpsd.
+const GATEWAY_PREFIX: &str = "/_httpsd/";
+
+type HttpsClient = Client<HttpsConnector<HttpConnector>, Body>;
 
 struct ProxyState {
-    client: Client<HttpConnector, Body>,
+    client: HttpsClient,
     upstream_port: u16,
     listen_port: u16,
     cache: ResponseCache,
@@ -49,7 +58,7 @@ struct CacheEntry {
     status: StatusCode,
     headers: HeaderMap,
     body: Vec<u8>,
-    stored: Instant,
+    expires: Instant,
 }
 
 struct ResponseCache {
@@ -64,34 +73,41 @@ impl ResponseCache {
     }
 
     fn get(&self, key: &str) -> Option<CacheEntry> {
+        let now = Instant::now();
         let mut entries = self
             .entries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let entry = entries.get(key)?;
-        if entry.stored.elapsed() > CACHE_TTL {
+        if entries.get(key).is_some_and(|entry| entry.expires <= now) {
             entries.remove(key);
-            return None;
         }
-        Some(entry.clone())
+        entries.get(key).cloned()
     }
 
     fn put(&self, key: String, entry: CacheEntry) {
-        if entry.body.len() > MAX_CACHE_BODY {
+        if entry.body.len() > MAX_CACHE_BODY || entry.body.len() > MAX_CACHE_TOTAL {
             return;
         }
+        let now = Instant::now();
         let mut entries = self
             .entries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        entries.retain(|_, cached| cached.stored.elapsed() <= CACHE_TTL);
-        if entries.len() >= MAX_CACHE_ENTRIES {
-            if let Some(oldest) = entries
+        entries.retain(|_, cached| cached.expires > now);
+
+        let mut total: usize = entries.values().map(|cached| cached.body.len()).sum();
+        while entries.len() >= MAX_CACHE_ENTRIES
+            || total.saturating_add(entry.body.len()) > MAX_CACHE_TOTAL
+        {
+            let Some(oldest) = entries
                 .iter()
-                .min_by_key(|(_, cached)| cached.stored)
+                .min_by_key(|(_, cached)| cached.expires)
                 .map(|(key, _)| key.clone())
-            {
-                entries.remove(&oldest);
+            else {
+                break;
+            };
+            if let Some(removed) = entries.remove(&oldest) {
+                total = total.saturating_sub(removed.body.len());
             }
         }
         entries.insert(key, entry);
@@ -103,6 +119,49 @@ impl ResponseCache {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
     }
+}
+
+/// Per-request knowledge needed to rewrite a document so that every fetch goes
+/// back through httpsd.
+struct RewriteContext {
+    /// `https://<host>[:port]` for the request currently being served.
+    public: String,
+    /// Lowercased authority of the public origin (`host` or `host:port`).
+    authority: String,
+    upstream_port: u16,
+    /// Lowercased `Host` the browser used, if it sent one.
+    original_host: Option<String>,
+    /// For gateway responses: the third-party `(scheme, authority)` the body
+    /// came from. Root-relative URLs belong to that origin, not to httpsd.
+    external: Option<(String, String)>,
+}
+
+impl RewriteContext {
+    fn new(original_host: Option<&str>, upstream_port: u16, listen_port: u16) -> Self {
+        let original_host = original_host
+            .filter(|host| !host.trim().is_empty())
+            .map(str::to_ascii_lowercase);
+        let authority = original_host
+            .clone()
+            .unwrap_or_else(|| format!("localhost:{listen_port}"));
+        Self {
+            public: public_origin(original_host.as_deref(), listen_port),
+            authority,
+            upstream_port,
+            original_host,
+            external: None,
+        }
+    }
+}
+
+/// Extracts the `(scheme, authority)` from an absolute URL.
+fn target_parts(target: &str) -> Option<(String, String)> {
+    let (scheme, rest) = target.split_once("://")?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    if end == 0 {
+        return None;
+    }
+    Some((scheme.to_ascii_lowercase(), rest[..end].to_string()))
 }
 
 #[tokio::main]
@@ -157,8 +216,15 @@ async fn run() -> Result<()> {
             )
         })?;
 
-    let mut connector = HttpConnector::new();
-    connector.enforce_http(false);
+    // The same client handles the plain-http upstream and https third-party
+    // origins, using the system trust store for the latter.
+    let connector = HttpsConnectorBuilder::new()
+        .with_native_roots()
+        .context("load system tls roots")?
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .build();
     let client = Client::builder(TokioExecutor::new()).build::<_, Body>(connector);
 
     let state = Arc::new(ProxyState {
@@ -179,6 +245,10 @@ async fn run() -> Result<()> {
     log(
         "httpsd",
         &format!("listening on https://0.0.0.0:{listen_port} -> http://127.0.0.1:{upstream_port}"),
+    );
+    log(
+        "httpsd",
+        "external resources are proxied and cached under /_httpsd/",
     );
 
     let handle = axum_server::Handle::new();
@@ -331,6 +401,7 @@ async fn proxy_handler(
     mut request: Request<Body>,
 ) -> Response<Body> {
     let method = request.method().as_str().to_ascii_lowercase();
+    let route_path = request.uri().path().to_string();
     let path = request
         .uri()
         .path_and_query()
@@ -362,8 +433,24 @@ async fn proxy_handler(
         }
     }
 
-    let public = public_origin(original_host.as_deref(), state.listen_port);
-    let cache_key = cache_key(&public, origin.as_deref(), &path, request.headers());
+    if route_path.starts_with(GATEWAY_PREFIX) {
+        return match gateway_route(&route_path, request.uri().query()) {
+            Ok(target) => {
+                gateway_handler(&state, peer, request, target, original_host.as_deref()).await
+            }
+            Err(status) => {
+                log_access(peer, status, &method, &path, "-");
+                status.into_response()
+            }
+        };
+    }
+
+    let ctx = RewriteContext::new(
+        original_host.as_deref(),
+        state.upstream_port,
+        state.listen_port,
+    );
+    let cache_key = cache_key(&ctx.public, origin.as_deref(), &path, request.headers());
 
     let upgrading = wants_upgrade(request.headers());
     if method == "get" && !upgrading {
@@ -447,10 +534,10 @@ async fn proxy_handler(
     );
 
     if status != StatusCode::SWITCHING_PROTOCOLS {
-        let rewrites = rewrite_map(original_host.as_deref(), state.upstream_port, &public);
-        rewrite_header_values(&mut parts.headers, &rewrites);
+        rewrite_header_values(&mut parts.headers, &ctx);
         apply_cors(&mut parts.headers, origin.as_deref());
 
+        let html = is_html(&parts.headers);
         let rewritable = method != "head"
             && status == StatusCode::OK
             && is_rewritable_text(&parts.headers)
@@ -463,7 +550,7 @@ async fn proxy_handler(
             match to_bytes(raw, MAX_REWRITE_BODY).await {
                 Ok(bytes) => {
                     let original = bytes.to_vec();
-                    let rewritten = rewrite_bytes(&original, &rewrites).unwrap_or(original);
+                    let rewritten = rewrite_body(&original, &ctx, html).unwrap_or(original);
                     parts.headers.remove(header::CONTENT_ENCODING);
                     parts.headers.remove(header::ETAG);
                     parts.headers.remove("content-md5");
@@ -478,7 +565,7 @@ async fn proxy_handler(
                                 status,
                                 headers: parts.headers.clone(),
                                 body: rewritten.clone(),
-                                stored: Instant::now(),
+                                expires: Instant::now() + UPSTREAM_CACHE_TTL,
                             },
                         );
                     }
@@ -532,6 +619,329 @@ async fn proxy_handler(
     response
 }
 
+/// Fetches a third-party URL on behalf of the browser, rewrites nested
+/// references so they also come back through httpsd, and caches the result.
+async fn gateway_handler(
+    state: &ProxyState,
+    peer: SocketAddr,
+    request: Request<Body>,
+    target: String,
+    original_host: Option<&str>,
+) -> Response<Body> {
+    let mut ctx = RewriteContext::new(original_host, state.upstream_port, state.listen_port);
+    ctx.external = target_parts(&target);
+    let method = request.method().clone();
+    let method_name = method.as_str().to_ascii_lowercase();
+    let log_path = request
+        .uri()
+        .path_and_query()
+        .map(|value| value.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
+
+    if method != Method::GET && method != Method::HEAD {
+        let mut response = StatusCode::METHOD_NOT_ALLOWED.into_response();
+        response
+            .headers_mut()
+            .insert(header::ALLOW, HeaderValue::from_static("GET, HEAD"));
+        log_access(peer, response.status(), &method_name, &log_path, "-");
+        return response;
+    }
+
+    let origin = request
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string);
+    let range = request.headers().contains_key(header::RANGE);
+    // Rewritten bodies embed the public origin, so cache per public origin.
+    let cache_key = format!("gateway\x00{}\x00{target}", ctx.public);
+
+    if method == Method::GET && !range {
+        if let Some(entry) = state.cache.get(&cache_key) {
+            let CacheEntry {
+                status,
+                headers,
+                body,
+                ..
+            } = entry;
+            let mut response = Response::new(Body::from(body));
+            *response.status_mut() = status;
+            *response.headers_mut() = headers;
+            response
+                .headers_mut()
+                .insert("x-httpsd-cache", HeaderValue::from_static("hit"));
+            apply_cors(response.headers_mut(), origin.as_deref());
+            log_access(peer, status, &method_name, &log_path, "-");
+            return response;
+        }
+    }
+
+    let uri = match target.parse::<Uri>() {
+        Ok(uri) => uri,
+        Err(_) => {
+            log_access(peer, StatusCode::BAD_REQUEST, &method_name, &log_path, "-");
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    };
+
+    let mut builder = Request::builder().method(method.clone()).uri(uri);
+    {
+        let headers = builder.headers_mut().expect("gateway request headers");
+        if let Some(value) = request.headers().get(header::ACCEPT) {
+            headers.insert(header::ACCEPT, value.clone());
+        } else {
+            headers.insert(header::ACCEPT, HeaderValue::from_static("*/*"));
+        }
+        if let Some(value) = request.headers().get(header::ACCEPT_LANGUAGE) {
+            headers.insert(header::ACCEPT_LANGUAGE, value.clone());
+        }
+        if let Some(value) = request.headers().get(header::RANGE) {
+            headers.insert(header::RANGE, value.clone());
+        }
+        let user_agent = request
+            .headers()
+            .get(header::USER_AGENT)
+            .cloned()
+            .unwrap_or_else(|| HeaderValue::from_static("httpsd/0.1"));
+        headers.insert(header::USER_AGENT, user_agent);
+        headers.insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("identity"),
+        );
+    }
+
+    let gateway_request = match builder.body(Body::empty()) {
+        Ok(request) => request,
+        Err(_) => {
+            log_access(peer, StatusCode::BAD_REQUEST, &method_name, &log_path, "-");
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    };
+
+    let response = match state.client.request(gateway_request).await {
+        Ok(response) => response,
+        Err(err) => {
+            log_access(peer, StatusCode::BAD_GATEWAY, &method_name, &log_path, "-");
+            log_error("gateway", &format!("fetch failed for {target}: {err}"));
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("gateway fetch failed: {err}"),
+            )
+                .into_response();
+        }
+    };
+
+    let status = response.status();
+    let (mut parts, body) = response.into_parts();
+    let body = Body::new(body);
+    strip_hop_headers(&mut parts.headers, false);
+    // Cookies and origin-bound security policies from the third party must not
+    // leak onto (or apply to) the httpsd origin.
+    parts.headers.remove(header::SET_COOKIE);
+    for name in [
+        "strict-transport-security",
+        "alt-svc",
+        "clear-site-data",
+        "report-to",
+        "nel",
+    ] {
+        parts.headers.remove(name);
+    }
+    // Keep redirects inside the gateway too, otherwise the browser follows an
+    // absolute third-party Location and bypasses httpsd.
+    rewrite_header_values(&mut parts.headers, &ctx);
+
+    let html = is_html(&parts.headers);
+    let rewritable = method != Method::HEAD
+        && status == StatusCode::OK
+        && !range
+        && is_rewritable_text(&parts.headers)
+        && !is_content_encoded(&parts.headers);
+    let cacheable =
+        method == Method::GET && status == StatusCode::OK && !range && is_cacheable(&parts.headers);
+    let content_length = parts
+        .headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok());
+
+    let mut response = if rewritable {
+        match to_bytes(Body::new(body), MAX_REWRITE_BODY).await {
+            Ok(bytes) => {
+                let original = bytes.to_vec();
+                let rewritten = rewrite_body(&original, &ctx, html).unwrap_or(original);
+                parts.headers.remove(header::CONTENT_ENCODING);
+                parts.headers.remove(header::ETAG);
+                parts.headers.remove("content-md5");
+                parts.headers.remove(header::ACCEPT_RANGES);
+                if let Ok(value) = HeaderValue::from_str(&rewritten.len().to_string()) {
+                    parts.headers.insert(header::CONTENT_LENGTH, value);
+                }
+                if cacheable {
+                    state.cache.put(
+                        cache_key,
+                        CacheEntry {
+                            status,
+                            headers: parts.headers.clone(),
+                            body: rewritten.clone(),
+                            expires: Instant::now() + gateway_ttl(&parts.headers),
+                        },
+                    );
+                }
+                Response::from_parts(parts, Body::from(rewritten))
+            }
+            Err(err) => {
+                log_access(peer, StatusCode::BAD_GATEWAY, &method_name, &log_path, "-");
+                log_error(
+                    "gateway",
+                    &format!("read rewritable response for {target}: {err}"),
+                );
+                return StatusCode::BAD_GATEWAY.into_response();
+            }
+        }
+    } else if cacheable && content_length.is_none_or(|len| len <= MAX_CACHE_BODY) {
+        match to_bytes(Body::new(body), MAX_CACHE_BODY).await {
+            Ok(bytes) => {
+                let body = bytes.to_vec();
+                if let Ok(value) = HeaderValue::from_str(&body.len().to_string()) {
+                    parts.headers.insert(header::CONTENT_LENGTH, value);
+                }
+                state.cache.put(
+                    cache_key,
+                    CacheEntry {
+                        status,
+                        headers: parts.headers.clone(),
+                        body: body.clone(),
+                        expires: Instant::now() + gateway_ttl(&parts.headers),
+                    },
+                );
+                Response::from_parts(parts, Body::from(body))
+            }
+            Err(err) => {
+                log_access(peer, StatusCode::BAD_GATEWAY, &method_name, &log_path, "-");
+                log_error(
+                    "gateway",
+                    &format!("read cacheable response for {target}: {err}"),
+                );
+                return StatusCode::BAD_GATEWAY.into_response();
+            }
+        }
+    } else {
+        Response::from_parts(parts, Body::new(body))
+    };
+
+    response
+        .headers_mut()
+        .insert("x-httpsd-cache", HeaderValue::from_static("miss"));
+    apply_cors(response.headers_mut(), origin.as_deref());
+
+    let content_length = response
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string);
+    log_access(
+        peer,
+        status,
+        &method_name,
+        &log_path,
+        content_length.as_deref().unwrap_or("-"),
+    );
+    response
+}
+
+/// Splits `/_httpsd/<scheme>/<authority>/<path>?<query>` back into the URL to
+/// fetch. Returns an HTTP status when the request is not a valid gateway URL.
+fn gateway_route(path: &str, query: Option<&str>) -> Result<String, StatusCode> {
+    let rest = path
+        .strip_prefix(GATEWAY_PREFIX)
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let (scheme, rest) = rest.split_once('/').ok_or(StatusCode::BAD_REQUEST)?;
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let (authority, tail) = match rest.split_once('/') {
+        Some((authority, tail)) => (authority, format!("/{tail}")),
+        None => (rest, String::new()),
+    };
+    if authority.is_empty() || !authority_is_valid(authority) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if host_is_forbidden(authority) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let mut target = format!("{scheme}://{authority}{tail}");
+    if let Some(query) = query {
+        target.push('?');
+        target.push_str(query);
+    }
+    Ok(target)
+}
+
+fn authority_is_valid(authority: &str) -> bool {
+    !authority.contains('@')
+        && !authority.is_empty()
+        && authority.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b':' | b'[' | b']' | b'_')
+        })
+}
+
+/// Gatewaying loopback/link-local addresses would turn httpsd into an SSRF
+/// bridge to services on the machine it runs on.
+fn host_is_forbidden(authority: &str) -> bool {
+    let host = authority_host(authority)
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if host == "localhost" || host.ends_with(".localhost") {
+        return true;
+    }
+    match host.parse::<IpAddr>() {
+        Ok(ip) => {
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || match ip {
+                    IpAddr::V4(ip) => ip.is_link_local(),
+                    IpAddr::V6(ip) => (ip.segments()[0] & 0xffc0) == 0xfe80,
+                }
+        }
+        Err(_) => false,
+    }
+}
+
+fn authority_host(authority: &str) -> &str {
+    if let Some(rest) = authority.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return &rest[..end];
+        }
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => host,
+        _ => authority,
+    }
+}
+
+fn split_authority(authority: &str) -> (&str, Option<&str>) {
+    if authority.starts_with('[') {
+        if let Some(end) = authority.find(']') {
+            let host = &authority[..=end];
+            let port = authority
+                .get(end + 1..)
+                .and_then(|rest| rest.strip_prefix(':'));
+            return (host, port);
+        }
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => {
+            (host, Some(port))
+        }
+        _ => (authority, None),
+    }
+}
+
 fn public_origin(original_host: Option<&str>, listen_port: u16) -> String {
     match original_host {
         Some(host) if !host.trim().is_empty() => format!("https://{host}"),
@@ -566,61 +976,320 @@ fn request_identity(headers: &HeaderMap) -> String {
     }
 }
 
-fn rewrite_map(
-    original_host: Option<&str>,
-    upstream_port: u16,
-    public: &str,
-) -> Vec<(String, String)> {
-    let mut pairs = vec![
-        (
-            format!("http://127.0.0.1:{upstream_port}"),
-            public.to_string(),
-        ),
-        (
-            format!("http://localhost:{upstream_port}"),
-            public.to_string(),
-        ),
-        (
-            format!("http://0.0.0.0:{upstream_port}"),
-            public.to_string(),
-        ),
-        (format!("http://[::1]:{upstream_port}"), public.to_string()),
-    ];
-    if let Some(host) = original_host {
-        if !host.trim().is_empty() {
-            pairs.push((format!("http://{host}"), public.to_string()));
-        }
-    }
-    pairs.sort_by_key(|pair| std::cmp::Reverse(pair.0.len()));
-    pairs.dedup_by(|a, b| a.0 == b.0);
-    pairs
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UrlKind {
+    Absolute,
+    ProtocolRelative,
+    RootRelative,
 }
 
-fn rewrite_bytes(body: &[u8], rewrites: &[(String, String)]) -> Option<Vec<u8>> {
-    let text = std::str::from_utf8(body).ok()?;
+/// Rewrites every absolute (and protocol-relative) URL in a text document.
+fn rewrite_text(text: &str, ctx: &RewriteContext) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
     let mut changed = false;
-    let mut rewritten = text.to_string();
-    for (from, to) in rewrites {
-        if rewritten.contains(from) {
-            rewritten = rewritten.replace(from, to);
-            changed = true;
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let Some((start, body_start, kind)) = url_hit(text, i) else {
+            i += 1;
+            continue;
+        };
+        let end = url_end(bytes, body_start);
+        if end <= start {
+            i += 1;
+            continue;
+        }
+        let raw = &text[start..end];
+        if let Some(replacement) = rewrite_url(raw, ctx, kind) {
+            if replacement != raw {
+                out.push_str(&text[copied..start]);
+                out.push_str(&replacement);
+                copied = end;
+                changed = true;
+            }
+        }
+        i = end.max(i + 1);
+    }
+
+    if !changed {
+        return None;
+    }
+    out.push_str(&text[copied..]);
+    Some(out)
+}
+
+/// Finds a URL beginning at `i`, returning the URL start and the byte index
+/// just past its scheme (or `//` for protocol-relative URLs).
+fn url_hit(text: &str, i: usize) -> Option<(usize, usize, UrlKind)> {
+    let rest = &text[i..];
+    let bytes = rest.as_bytes();
+
+    if bytes.len() >= 8 && bytes[..8].eq_ignore_ascii_case(b"https://") {
+        return Some((i, i + 8, UrlKind::Absolute));
+    }
+    if bytes.len() >= 7 && bytes[..7].eq_ignore_ascii_case(b"http://") {
+        return Some((i, i + 7, UrlKind::Absolute));
+    }
+
+    // Protocol-relative URLs only in value position, to avoid mistaking `//`
+    // comments for hosts.
+    if bytes.starts_with(b"//") && i > 0 {
+        let previous = text.as_bytes()[i - 1];
+        if matches!(previous, b'"' | b'\'' | b'=' | b'(') {
+            let body = &text[i + 2..];
+            let end = body
+                .find(|c: char| c == '/' || c == '?' || c == '#' || c.is_whitespace())
+                .unwrap_or(body.len());
+            let host = &body[..end];
+            let valid = !host.is_empty()
+                && (host.contains('.') || host.contains(':'))
+                && host.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric()
+                        || matches!(byte, b'.' | b'-' | b':' | b'[' | b']' | b'_')
+                });
+            if valid {
+                return Some((i, i + 2, UrlKind::ProtocolRelative));
+            }
         }
     }
-    changed.then(|| rewritten.into_bytes())
+
+    // Root-relative URLs in external content belong to the third-party origin.
+    // Only treat them as URLs in value position (`href="/x"`, `url(/x)`), and
+    // keep the first character restrictive so regex literals are not touched.
+    if bytes[0] == b'/' && i > 0 && bytes.get(1).is_some_and(|byte| url_path_start(*byte)) {
+        let previous = text.as_bytes()[i - 1];
+        if matches!(previous, b'"' | b'\'' | b'=' | b'(') {
+            return Some((i, i + 1, UrlKind::RootRelative));
+        }
+    }
+
+    None
 }
 
-fn rewrite_header_values(headers: &mut HeaderMap, rewrites: &[(String, String)]) {
-    rewrite_header(headers, header::LOCATION, rewrites);
-    rewrite_header(headers, header::CONTENT_LOCATION, rewrites);
-    rewrite_header(headers, header::LINK, rewrites);
-    rewrite_header(headers, header::REFRESH, rewrites);
+fn url_path_start(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'.' | b'_'
+                | b'-'
+                | b'~'
+                | b'%'
+                | b'!'
+                | b'$'
+                | b'&'
+                | b'*'
+                | b'+'
+                | b','
+                | b';'
+                | b'='
+                | b':'
+                | b'@'
+        )
 }
 
-fn rewrite_header(
-    headers: &mut HeaderMap,
-    name: header::HeaderName,
-    rewrites: &[(String, String)],
-) {
+fn url_end(bytes: &[u8], start: usize) -> usize {
+    let mut i = start;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if byte.is_ascii_whitespace()
+            || matches!(
+                byte,
+                b'"' | b'\'' | b'<' | b'>' | b'`' | b'(' | b')' | b'\\'
+            )
+        {
+            break;
+        }
+        i += 1;
+    }
+    i
+}
+
+/// Returns the replacement for `raw`, or `None` when the URL should be left
+/// untouched (relative URLs never reach this function).
+fn rewrite_url(raw: &str, ctx: &RewriteContext, kind: UrlKind) -> Option<String> {
+    if kind == UrlKind::RootRelative {
+        let (scheme, authority) = ctx.external.as_ref()?;
+        return Some(format!(
+            "{}{}{}/{}{}",
+            ctx.public, GATEWAY_PREFIX, scheme, authority, raw
+        ));
+    }
+
+    let protocol_relative = kind == UrlKind::ProtocolRelative;
+    let (scheme, after) = if protocol_relative {
+        ("https", &raw[2..])
+    } else {
+        let scheme_end = raw.find("://")?;
+        (&raw[..scheme_end], &raw[scheme_end + 3..])
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    if !matches!(scheme.as_str(), "http" | "https" | "ws" | "wss") {
+        return None;
+    }
+
+    let split = after.find(['/', '?', '#']).unwrap_or(after.len());
+    let authority = &after[..split];
+    let rest = &after[split..];
+    if authority.is_empty() {
+        return None;
+    }
+    let authority_lower = authority.to_ascii_lowercase();
+
+    // Already talking to httpsd.
+    if authority_lower == ctx.authority {
+        return None;
+    }
+
+    // The upstream server referring to itself, by any of its local aliases.
+    if is_upstream_authority(&authority_lower, ctx.upstream_port)
+        || ctx
+            .original_host
+            .as_deref()
+            .is_some_and(|host| same_authority(&authority_lower, host))
+    {
+        return Some(format!("{}{}", public_scheme(&ctx.public, &scheme), rest));
+    }
+
+    // Third-party resources are only interesting over http(s); websockets are
+    // left to the browser.
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    if is_namespace_authority(&authority_lower, rest) || host_is_forbidden(authority) {
+        return None;
+    }
+
+    Some(gateway_url(ctx, &scheme, authority, rest))
+}
+
+fn public_scheme(public: &str, scheme: &str) -> String {
+    if scheme.starts_with("ws") {
+        public.replacen("https://", "wss://", 1)
+    } else {
+        public.to_string()
+    }
+}
+
+fn is_upstream_authority(authority: &str, upstream_port: u16) -> bool {
+    let (host, port) = split_authority(authority);
+    let expected = upstream_port.to_string();
+    port == Some(expected.as_str())
+        && matches!(
+            host,
+            "127.0.0.1" | "localhost" | "0.0.0.0" | "[::1]" | "::1"
+        )
+}
+
+fn same_authority(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let (a_host, a_port) = split_authority(a);
+    let (b_host, b_port) = split_authority(b);
+    a_host == b_host && (a_port.is_none() || b_port.is_none() || a_port == b_port)
+}
+
+/// XML namespace identifiers look like URLs but are never fetched.
+fn is_namespace_authority(authority: &str, rest: &str) -> bool {
+    let host = authority_host(authority).to_ascii_lowercase();
+    matches!(
+        host.as_str(),
+        "www.w3.org" | "w3.org" | "schemas.xmlsoap.org" | "purl.org" | "xmlns.com" | "ns.adobe.com"
+    ) || (host == "www.apple.com" && (rest.starts_with("/DTDs/") || rest.starts_with("/DTD/")))
+}
+
+fn gateway_url(ctx: &RewriteContext, scheme: &str, authority: &str, rest: &str) -> String {
+    let mut url = format!("{}{}{}/{}", ctx.public, GATEWAY_PREFIX, scheme, authority);
+    // A trailing slash makes relative URLs inside documents resolve back to
+    // the third-party root instead of the gateway path's parent.
+    if rest.is_empty() || rest.starts_with('?') || rest.starts_with('#') {
+        url.push('/');
+    }
+    url.push_str(rest);
+    url
+}
+
+fn rewrite_body(body: &[u8], ctx: &RewriteContext, html: bool) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(body).ok()?;
+    let text = if html {
+        strip_integrity(text)
+    } else {
+        Cow::Borrowed(text)
+    };
+    match rewrite_text(&text, ctx) {
+        Some(rewritten) => Some(rewritten.into_bytes()),
+        None if matches!(text, Cow::Owned(_)) => Some(text.into_owned().into_bytes()),
+        None => None,
+    }
+}
+
+/// Proxied bodies are modified, so subresource-integrity hashes no longer
+/// match. The `integrity` attribute has to go or the browser rejects the file.
+fn strip_integrity(html: &str) -> Cow<'_, str> {
+    let lower = html.to_ascii_lowercase();
+    let mut out = String::new();
+    let mut copied = 0;
+    let mut search = 0;
+
+    while let Some(offset) = lower[search..].find("integrity") {
+        let start = search + offset;
+        search = start + "integrity".len();
+        if start == 0 || !html.as_bytes()[start - 1].is_ascii_whitespace() {
+            continue;
+        }
+        // Only inside a tag, never in text or inline script content.
+        if html[..start].rfind('<') <= html[..start].rfind('>') {
+            continue;
+        }
+        let mut cursor = search;
+        while cursor < html.len() && html.as_bytes()[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= html.len() || html.as_bytes()[cursor] != b'=' {
+            continue;
+        }
+        cursor += 1;
+        while cursor < html.len() && html.as_bytes()[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= html.len() {
+            break;
+        }
+        let quote = html.as_bytes()[cursor];
+        let end = if quote == b'"' || quote == b'\'' {
+            match html[cursor + 1..].find(quote as char) {
+                Some(offset) => cursor + 1 + offset + 1,
+                None => continue,
+            }
+        } else {
+            html[cursor..]
+                .find(|c: char| c.is_ascii_whitespace() || c == '>')
+                .map(|offset| cursor + offset)
+                .unwrap_or(html.len())
+        };
+        out.push_str(&html[copied..start]);
+        copied = end;
+        search = end;
+    }
+
+    if copied == 0 {
+        Cow::Borrowed(html)
+    } else {
+        out.push_str(&html[copied..]);
+        Cow::Owned(out)
+    }
+}
+
+fn rewrite_header_values(headers: &mut HeaderMap, ctx: &RewriteContext) {
+    rewrite_header(headers, header::LOCATION, ctx);
+    rewrite_header(headers, header::CONTENT_LOCATION, ctx);
+    rewrite_header(headers, header::LINK, ctx);
+    rewrite_header(headers, header::REFRESH, ctx);
+}
+
+fn rewrite_header(headers: &mut HeaderMap, name: header::HeaderName, ctx: &RewriteContext) {
     let Some(value) = headers
         .get(&name)
         .and_then(|value| value.to_str().ok())
@@ -628,15 +1297,23 @@ fn rewrite_header(
     else {
         return;
     };
-    let mut rewritten = value.clone();
-    for (from, to) in rewrites {
-        rewritten = rewritten.replace(from, to);
+    let Some(rewritten) = rewrite_text(&value, ctx) else {
+        return;
+    };
+    if let Ok(value) = HeaderValue::from_str(&rewritten) {
+        headers.insert(name, value);
     }
-    if rewritten != value {
-        if let Ok(value) = HeaderValue::from_str(&rewritten) {
-            headers.insert(name, value);
-        }
-    }
+}
+
+fn is_html(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            let value = value.to_ascii_lowercase();
+            value.starts_with("text/html") || value.starts_with("application/xhtml+xml")
+        })
+        .unwrap_or(false)
 }
 
 fn is_rewritable_text(headers: &HeaderMap) -> bool {
@@ -645,9 +1322,13 @@ fn is_rewritable_text(headers: &HeaderMap) -> bool {
         .and_then(|value| value.to_str().ok())
         .map(|value| {
             let value = value.to_ascii_lowercase();
-            value.starts_with("text/html")
-                || value.starts_with("application/xhtml+xml")
-                || value.starts_with("text/css")
+            if value.starts_with("text/event-stream") {
+                return false;
+            }
+            value.starts_with("text/")
+                || value.contains("javascript")
+                || value.contains("json")
+                || value.contains("xml")
                 || value.starts_with("image/svg+xml")
         })
         .unwrap_or(false)
@@ -678,6 +1359,27 @@ fn is_cacheable(headers: &HeaderMap) -> bool {
         }
     }
     true
+}
+
+fn gateway_ttl(headers: &HeaderMap) -> Duration {
+    if let Some(value) = headers
+        .get(header::CACHE_CONTROL)
+        .and_then(|value| value.to_str().ok())
+    {
+        let value = value.to_ascii_lowercase();
+        for part in value.split(',') {
+            let part = part.trim();
+            if let Some(max_age) = part.strip_prefix("max-age=") {
+                if let Ok(seconds) = max_age.trim_matches('"').trim().parse::<u64>() {
+                    return Duration::from_secs(seconds.clamp(60, 86_400));
+                }
+            }
+        }
+        if value.contains("immutable") {
+            return Duration::from_secs(86_400);
+        }
+    }
+    GATEWAY_CACHE_TTL
 }
 
 fn cors_preflight(headers: &HeaderMap) -> Option<String> {
@@ -837,13 +1539,12 @@ fn log_access(peer: SocketAddr, status: StatusCode, method: &str, path: &str, by
 mod tests {
     use super::*;
 
-    fn rewrites() -> Vec<(String, String)> {
-        rewrite_map(Some("localhost:8443"), 8000, "https://localhost:8443")
+    fn ctx() -> RewriteContext {
+        RewriteContext::new(Some("localhost:8443"), 8000, 8443)
     }
 
     fn rewrite(input: &str) -> String {
-        let output = rewrite_bytes(input.as_bytes(), &rewrites()).expect("content changed");
-        String::from_utf8(output).expect("utf-8")
+        rewrite_text(input, &ctx()).expect("content changed")
     }
 
     #[test]
@@ -865,7 +1566,7 @@ mod tests {
         assert!(output.contains(r#"poster="https://localhost:8443/p.jpg""#));
         assert!(output.contains(r#"src="https://localhost:8443/v.mp4""#));
         assert!(output.contains(r#"src="https://localhost:8443/c.vtt""#));
-        assert!(!output.contains("http://"));
+        assert!(!output.contains("http://127.0.0.1"));
     }
 
     #[test]
@@ -878,7 +1579,6 @@ mod tests {
 
         assert!(output.contains("url(https://localhost:8443/bg.webp)"));
         assert!(output.contains(r#"url("https://localhost:8443/p.jpg")"#));
-        assert!(!output.contains("http://"));
     }
 
     #[test]
@@ -897,8 +1597,135 @@ mod tests {
     }
 
     #[test]
-    fn leaves_unrelated_urls_alone() {
-        let html = r#"<img src="https://cdn.example.com/a.png"><a href="http://example.com">x</a>"#;
-        assert!(rewrite_bytes(html.as_bytes(), &rewrites()).is_none());
+    fn routes_external_images_through_gateway() {
+        let html = r#"<img src="https://cdn.example.com/a.png">"#;
+        let output = rewrite(html);
+
+        assert_eq!(
+            output,
+            r#"<img src="https://localhost:8443/_httpsd/https/cdn.example.com/a.png">"#
+        );
+    }
+
+    #[test]
+    fn routes_google_fonts_through_gateway() {
+        let html = concat!(
+            r#"<link href="https://fonts.googleapis.com/css2?family=Inter&display=swap" "#,
+            r#"rel="stylesheet">"#
+        );
+        let output = rewrite(html);
+
+        assert!(output.contains(
+            r#"https://localhost:8443/_httpsd/https/fonts.googleapis.com/css2?family=Inter&display=swap"#
+        ));
+    }
+
+    #[test]
+    fn rewrites_nested_css_urls_from_gateway() {
+        let css = r#"@font-face { src: url(https://fonts.gstatic.com/s/inter/v1/x.woff2) format("woff2"); }"#;
+        let output = rewrite(css);
+
+        assert!(output.contains(
+            "url(https://localhost:8443/_httpsd/https/fonts.gstatic.com/s/inter/v1/x.woff2)"
+        ));
+    }
+
+    #[test]
+    fn routes_protocol_relative_assets_through_gateway() {
+        let html = r#"<script src="//cdn.example.com/app.js"></script>"#;
+        let output = rewrite(html);
+
+        assert_eq!(
+            output,
+            r#"<script src="https://localhost:8443/_httpsd/https/cdn.example.com/app.js"></script>"#
+        );
+    }
+
+    #[test]
+    fn leaves_data_relative_and_namespace_urls_alone() {
+        let html = concat!(
+            r#"<img src="/a.png">"#,
+            r#"<img src="data:image/png;base64,AAAA">"#,
+            r#"<a href="mailto:someone@example.com">x</a>"#,
+            r#"<svg xmlns="http://www.w3.org/2000/svg"></svg>"#
+        );
+        assert!(rewrite_text(html, &ctx()).is_none());
+    }
+
+    #[test]
+    fn rewrites_root_relative_urls_in_external_documents() {
+        let mut external = ctx();
+        external.external = Some(("https".to_string(), "cdn.example.com".to_string()));
+        let css = r#"body{background:url(/pic.png)}"#;
+
+        assert_eq!(
+            rewrite_text(css, &external).unwrap(),
+            r#"body{background:url(https://localhost:8443/_httpsd/https/cdn.example.com/pic.png)}"#
+        );
+        // Upstream content is same-origin, so its root-relative URLs stay put.
+        assert!(rewrite_text(css, &ctx()).is_none());
+    }
+
+    #[test]
+    fn does_not_gateway_itself_twice() {
+        let html = r#"<img src="https://localhost:8443/_httpsd/https/cdn.example.com/a.png">"#;
+        assert!(rewrite_text(html, &ctx()).is_none());
+    }
+
+    #[test]
+    fn strips_integrity_attributes() {
+        let html = concat!(
+            r#"<script src="/a.js" integrity="sha384-abc" crossorigin="anonymous"></script>"#,
+            r#"<link rel="stylesheet" href="/b.css" integrity='sha256-def'>"#
+        );
+        let output = strip_integrity(html);
+
+        assert!(!output.contains("integrity"));
+        assert!(output.contains(r#"src="/a.js""#));
+        assert!(output.contains(r#"href="/b.css""#));
+    }
+
+    #[test]
+    fn parses_gateway_routes() {
+        assert_eq!(
+            gateway_route("/_httpsd/https/example.com/a", Some("b=1")).unwrap(),
+            "https://example.com/a?b=1"
+        );
+        assert_eq!(
+            gateway_route("/_httpsd/http/example.com:8080/a/b", None).unwrap(),
+            "http://example.com:8080/a/b"
+        );
+        assert_eq!(
+            gateway_route("/_httpsd/https/example.com", None).unwrap(),
+            "https://example.com"
+        );
+        assert_eq!(
+            gateway_route("/_httpsd/ftp/example.com/a", None).unwrap_err(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn blocks_gateway_to_loopback() {
+        assert_eq!(
+            gateway_route("/_httpsd/https/127.0.0.1/secret", None).unwrap_err(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            gateway_route("/_httpsd/https/localhost/secret", None).unwrap_err(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn builds_gateway_urls_with_relative_safe_paths() {
+        assert_eq!(
+            gateway_url(&ctx(), "https", "example.com", ""),
+            "https://localhost:8443/_httpsd/https/example.com/"
+        );
+        assert_eq!(
+            gateway_url(&ctx(), "https", "example.com", "?q=1"),
+            "https://localhost:8443/_httpsd/https/example.com/?q=1"
+        );
     }
 }

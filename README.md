@@ -16,15 +16,31 @@ then open `https://localhost:8443` (or `https://<lan-ip>:8443`).
 
 ## rewriting and caching
 
-httpsd rewrites the upstream's `http://` self-references so the page keeps working over https. it handles:
+httpsd rewrites every URL it can find, not just the upstream's own `http://` self-references. third-party resources such as google fonts, cdn scripts, and externally hosted images are pointed back at httpsd, fetched by httpsd, cached, and served from the httpsd origin. the browser never needs to contact those hosts directly. it handles:
 
 - `text/html` and `application/xhtml+xml` bodies, including `href`, `src`, `action`, `srcset`, `poster`, `<source>`, inline css `url(...)`, and urls inside inline scripts
-- `text/css` stylesheets and `image/svg+xml` documents, so images and videos referenced from css or svg also go through httpsd
+- `text/css` stylesheets, javascript, json, xml, and `image/svg+xml` documents
+- absolute `http://` / `https://` urls, protocol-relative `//host/...` urls, and root-relative `/asset` urls inside third-party documents
 - `location`, `content-location`, `link`, and `refresh` response headers
+- `integrity` attributes are stripped from rewritten html because proxied bodies no longer match their subresource hashes
 
 the upstream origins `http://127.0.0.1:<server-port>`, `http://localhost:<server-port>`, `http://0.0.0.0:<server-port>`, `http://[::1]:<server-port>`, and `http://<request-host>` are replaced with `https://<request-host>`.
 
-rewritten html, css, and svg is cached in memory for five minutes (at most 128 entries / 8 mib per entry). cache keys include the requested host, `origin`, and a hash of `cookie`/`authorization`, so responses are not shared across identities. responses with `set-cookie` or `cache-control: no-store`, `no-cache`, or `private` are not cached. successful non-GET requests clear the cache.
+### external gateway
+
+third-party urls are rewritten to:
+
+```
+https://<request-host>/_httpsd/<scheme>/<authority>/<path>?<query>
+```
+
+httpsd fetches that url over https (using the system trust store), rewrites any nested urls in the response, and caches it. relative and root-relative references inside a third-party css or html file are resolved against that third-party origin, so font files, images, and imports keep working. redirects are rewritten into gateway urls as well. the `/_httpsd/` prefix is reserved by httpsd.
+
+loopback, unspecified, multicast, and link-local addresses are refused (`403`) so the gateway cannot be used to reach services on the machine running httpsd.
+
+### cache
+
+rewritten upstream responses are cached for five minutes. gateway responses use the origin's `cache-control: max-age` clamped to 1 minute - 24 hours, defaulting to one hour. at most 512 entries / 8 mib per entry / 128 mib total are kept in memory. upstream cache keys include the requested host, `origin`, and a hash of `cookie`/`authorization`, so responses are not shared across identities. gateway cache keys include the public origin and target url; cookies are never forwarded to third parties. responses with `set-cookie` or `cache-control: no-store`, `no-cache`, or `private` are not cached. successful non-GET requests clear the upstream cache. responses carry `x-httpsd-cache: hit` or `miss`.
 
 ## cors
 
