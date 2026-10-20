@@ -1,18 +1,20 @@
 use std::{
+    collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, Context, Result};
 use axum::{
-    body::Body,
+    body::{to_bytes, Body},
     extract::{ConnectInfo, State},
     http::{
         header::{self, HeaderMap, HeaderValue},
-        Request, Response, StatusCode, Uri,
+        Method, Request, Response, StatusCode, Uri,
     },
+    response::IntoResponse,
     Router,
 };
 use axum_server::tls_rustls::RustlsConfig;
@@ -30,10 +32,77 @@ const CERT_FILE: &str = "cert.pem";
 const KEY_FILE: &str = "key.pem";
 const FINGERPRINT_FILE: &str = "fingerprint.txt";
 const BIND_ADDR: Ipv4Addr = Ipv4Addr::UNSPECIFIED;
+const MAX_REWRITE_BODY: usize = 16 * 1024 * 1024;
+const MAX_CACHE_BODY: usize = 8 * 1024 * 1024;
+const MAX_CACHE_ENTRIES: usize = 128;
+const CACHE_TTL: Duration = Duration::from_secs(300);
 
 struct ProxyState {
     client: Client<HttpConnector, Body>,
     upstream_port: u16,
+    listen_port: u16,
+    cache: ResponseCache,
+}
+
+#[derive(Clone)]
+struct CacheEntry {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: Vec<u8>,
+    stored: Instant,
+}
+
+struct ResponseCache {
+    entries: Mutex<HashMap<String, CacheEntry>>,
+}
+
+impl ResponseCache {
+    fn new() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn get(&self, key: &str) -> Option<CacheEntry> {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = entries.get(key)?;
+        if entry.stored.elapsed() > CACHE_TTL {
+            entries.remove(key);
+            return None;
+        }
+        Some(entry.clone())
+    }
+
+    fn put(&self, key: String, entry: CacheEntry) {
+        if entry.body.len() > MAX_CACHE_BODY {
+            return;
+        }
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        entries.retain(|_, cached| cached.stored.elapsed() <= CACHE_TTL);
+        if entries.len() >= MAX_CACHE_ENTRIES {
+            if let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, cached)| cached.stored)
+                .map(|(key, _)| key.clone())
+            {
+                entries.remove(&oldest);
+            }
+        }
+        entries.insert(key, entry);
+    }
+
+    fn clear(&self) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
 }
 
 #[tokio::main]
@@ -95,6 +164,8 @@ async fn run() -> Result<()> {
     let state = Arc::new(ProxyState {
         client,
         upstream_port,
+        listen_port,
+        cache: ResponseCache::new(),
     });
 
     let app = Router::new().fallback(proxy_handler).with_state(state);
@@ -269,9 +340,48 @@ async fn proxy_handler(
         .headers()
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string)
+        // HTTP/2 carries the authority in the request URI instead of Host.
+        .or_else(|| {
+            request
+                .uri()
+                .authority()
+                .map(|authority| authority.as_str().to_string())
+        });
+    let origin = request
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
         .map(ToString::to_string);
 
+    if request.method() == Method::OPTIONS {
+        if let Some(origin) = cors_preflight(request.headers()) {
+            let response = preflight_response(request.headers(), &origin);
+            log_access(peer, response.status(), &method, &path, "-");
+            return response;
+        }
+    }
+
+    let public = public_origin(original_host.as_deref(), state.listen_port);
+    let cache_key = cache_key(&public, origin.as_deref(), &path, request.headers());
+
     let upgrading = wants_upgrade(request.headers());
+    if method == "get" && !upgrading {
+        if let Some(entry) = state.cache.get(&cache_key) {
+            let CacheEntry {
+                status,
+                headers,
+                body,
+                ..
+            } = entry;
+            let mut response = Response::new(Body::from(body));
+            *response.status_mut() = status;
+            *response.headers_mut() = headers;
+            log_access(peer, status, &method, &path, "-");
+            return response;
+        }
+    }
+
     let client_upgrade = if upgrading {
         Some(hyper::upgrade::on(&mut request))
     } else {
@@ -294,14 +404,19 @@ async fn proxy_handler(
     request
         .headers_mut()
         .insert("x-forwarded-proto", HeaderValue::from_static("https"));
-    if let Some(host) = original_host {
-        if let Ok(value) = HeaderValue::from_str(&host) {
+    if let Some(host) = &original_host {
+        if let Ok(value) = HeaderValue::from_str(host) {
             request.headers_mut().insert("x-forwarded-host", value);
         }
     }
     if let Ok(value) = HeaderValue::from_str(&peer.ip().to_string()) {
         request.headers_mut().insert("x-forwarded-for", value);
     }
+    // Rewriting needs plain text; ask upstream not to compress it.
+    request.headers_mut().insert(
+        header::ACCEPT_ENCODING,
+        HeaderValue::from_static("identity"),
+    );
     strip_hop_headers(request.headers_mut(), upgrading);
     *request.uri_mut() = uri;
     *request.version_mut() = axum::http::Version::HTTP_11;
@@ -324,35 +439,310 @@ async fn proxy_handler(
     };
 
     let status = response.status();
-    let content_length = response
-        .headers()
-        .get(header::CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .map(ToString::to_string);
     let (mut parts, body) = response.into_parts();
+    let body = Body::new(body);
     strip_hop_headers(
         &mut parts.headers,
         status == StatusCode::SWITCHING_PROTOCOLS,
     );
-    let mut response = Response::from_parts(parts, Body::new(body));
 
-    if status == StatusCode::SWITCHING_PROTOCOLS {
-        if let Some(client_upgrade) = client_upgrade {
-            if response.headers().get(header::UPGRADE).is_some() {
-                let server_upgrade = hyper::upgrade::on(&mut response);
-                tokio::spawn(pipe_upgrade(client_upgrade, server_upgrade));
+    if status != StatusCode::SWITCHING_PROTOCOLS {
+        let rewrites = rewrite_map(original_host.as_deref(), state.upstream_port, &public);
+        rewrite_header_values(&mut parts.headers, &rewrites);
+        apply_cors(&mut parts.headers, origin.as_deref());
+
+        let rewritable = method != "head"
+            && status == StatusCode::OK
+            && is_html(&parts.headers)
+            && !is_content_encoded(&parts.headers);
+
+        let mut body = Some(body);
+        let mut rewritten_body = None;
+        if rewritable {
+            let raw = body.take().expect("response body");
+            match to_bytes(raw, MAX_REWRITE_BODY).await {
+                Ok(bytes) => {
+                    let original = bytes.to_vec();
+                    let rewritten = rewrite_bytes(&original, &rewrites).unwrap_or(original);
+                    parts.headers.remove(header::CONTENT_ENCODING);
+                    parts.headers.remove(header::ETAG);
+                    parts.headers.remove("content-md5");
+                    parts.headers.remove(header::ACCEPT_RANGES);
+                    if let Ok(value) = HeaderValue::from_str(&rewritten.len().to_string()) {
+                        parts.headers.insert(header::CONTENT_LENGTH, value);
+                    }
+                    if is_cacheable(&parts.headers) {
+                        state.cache.put(
+                            cache_key.clone(),
+                            CacheEntry {
+                                status,
+                                headers: parts.headers.clone(),
+                                body: rewritten.clone(),
+                                stored: Instant::now(),
+                            },
+                        );
+                    }
+                    rewritten_body = Some(rewritten);
+                }
+                Err(err) => {
+                    log_access(peer, StatusCode::BAD_GATEWAY, &method, &path, "-");
+                    log_error("proxy", &format!("read html response for {path}: {err}"));
+                    return StatusCode::BAD_GATEWAY.into_response();
+                }
             }
+        }
+
+        let body = match rewritten_body {
+            Some(bytes) => Body::from(bytes),
+            None => body.take().expect("response body"),
+        };
+        let response = Response::from_parts(parts, body);
+
+        if method != "get" && method != "head" && status.is_success() {
+            state.cache.clear();
+        }
+
+        let content_length = response
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string);
+        log_access(
+            peer,
+            status,
+            &method,
+            &path,
+            content_length.as_deref().unwrap_or("-"),
+        );
+        return response;
+    }
+
+    let mut response = Response::from_parts(parts, body);
+    if let Some(client_upgrade) = client_upgrade {
+        if response.headers().get(header::UPGRADE).is_some() {
+            let server_upgrade = hyper::upgrade::on(&mut response);
+            tokio::spawn(pipe_upgrade(client_upgrade, server_upgrade));
         }
     }
 
-    log_access(
-        peer,
-        status,
-        &method,
-        &path,
-        content_length.as_deref().unwrap_or("-"),
+    log_access(peer, status, &method, &path, "-");
+    response
+}
+
+fn public_origin(original_host: Option<&str>, listen_port: u16) -> String {
+    match original_host {
+        Some(host) if !host.trim().is_empty() => format!("https://{host}"),
+        _ => format!("https://localhost:{listen_port}"),
+    }
+}
+
+fn cache_key(public: &str, origin: Option<&str>, path: &str, headers: &HeaderMap) -> String {
+    let identity = request_identity(headers);
+    format!(
+        "{public}\x00{}\x00{path}\x00{identity}",
+        origin.unwrap_or("")
+    )
+}
+
+fn request_identity(headers: &HeaderMap) -> String {
+    let mut hasher = Sha256::new();
+    let mut present = false;
+    for name in [header::COOKIE, header::AUTHORIZATION] {
+        if let Some(value) = headers.get(&name) {
+            hasher.update(name.as_str().as_bytes());
+            hasher.update(b":");
+            hasher.update(value.as_bytes());
+            hasher.update(b"\n");
+            present = true;
+        }
+    }
+    if present {
+        fingerprint_sha256(&hasher.finalize())
+    } else {
+        String::new()
+    }
+}
+
+fn rewrite_map(
+    original_host: Option<&str>,
+    upstream_port: u16,
+    public: &str,
+) -> Vec<(String, String)> {
+    let mut pairs = vec![
+        (
+            format!("http://127.0.0.1:{upstream_port}"),
+            public.to_string(),
+        ),
+        (
+            format!("http://localhost:{upstream_port}"),
+            public.to_string(),
+        ),
+        (
+            format!("http://0.0.0.0:{upstream_port}"),
+            public.to_string(),
+        ),
+        (format!("http://[::1]:{upstream_port}"), public.to_string()),
+    ];
+    if let Some(host) = original_host {
+        if !host.trim().is_empty() {
+            pairs.push((format!("http://{host}"), public.to_string()));
+        }
+    }
+    pairs.sort_by_key(|pair| std::cmp::Reverse(pair.0.len()));
+    pairs.dedup_by(|a, b| a.0 == b.0);
+    pairs
+}
+
+fn rewrite_bytes(body: &[u8], rewrites: &[(String, String)]) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(body).ok()?;
+    let mut changed = false;
+    let mut rewritten = text.to_string();
+    for (from, to) in rewrites {
+        if rewritten.contains(from) {
+            rewritten = rewritten.replace(from, to);
+            changed = true;
+        }
+    }
+    changed.then(|| rewritten.into_bytes())
+}
+
+fn rewrite_header_values(headers: &mut HeaderMap, rewrites: &[(String, String)]) {
+    rewrite_header(headers, header::LOCATION, rewrites);
+    rewrite_header(headers, header::CONTENT_LOCATION, rewrites);
+    rewrite_header(headers, header::LINK, rewrites);
+    rewrite_header(headers, header::REFRESH, rewrites);
+}
+
+fn rewrite_header(
+    headers: &mut HeaderMap,
+    name: header::HeaderName,
+    rewrites: &[(String, String)],
+) {
+    let Some(value) = headers
+        .get(&name)
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string)
+    else {
+        return;
+    };
+    let mut rewritten = value.clone();
+    for (from, to) in rewrites {
+        rewritten = rewritten.replace(from, to);
+    }
+    if rewritten != value {
+        if let Ok(value) = HeaderValue::from_str(&rewritten) {
+            headers.insert(name, value);
+        }
+    }
+}
+
+fn is_html(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            let value = value.to_ascii_lowercase();
+            value.starts_with("text/html") || value.starts_with("application/xhtml+xml")
+        })
+        .unwrap_or(false)
+}
+
+fn is_content_encoded(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            let value = value.trim();
+            !value.is_empty() && !value.eq_ignore_ascii_case("identity")
+        })
+        .unwrap_or(false)
+}
+
+fn is_cacheable(headers: &HeaderMap) -> bool {
+    if headers.contains_key(header::SET_COOKIE) {
+        return false;
+    }
+    if let Some(value) = headers
+        .get(header::CACHE_CONTROL)
+        .and_then(|value| value.to_str().ok())
+    {
+        let value = value.to_ascii_lowercase();
+        if value.contains("no-store") || value.contains("no-cache") || value.contains("private") {
+            return false;
+        }
+    }
+    true
+}
+
+fn cors_preflight(headers: &HeaderMap) -> Option<String> {
+    let origin = headers.get(header::ORIGIN)?.to_str().ok()?.to_string();
+    headers
+        .get(header::ACCESS_CONTROL_REQUEST_METHOD)
+        .is_some()
+        .then_some(origin)
+}
+
+fn preflight_response(headers: &HeaderMap, origin: &str) -> Response<Body> {
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    let response_headers = response.headers_mut();
+    apply_cors(response_headers, Some(origin));
+
+    let methods = headers
+        .get(header::ACCESS_CONTROL_REQUEST_METHOD)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD");
+    if let Ok(value) = HeaderValue::from_str(methods) {
+        response_headers.insert(header::ACCESS_CONTROL_ALLOW_METHODS, value);
+    }
+
+    let allow_headers = headers
+        .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("content-type, authorization");
+    if let Ok(value) = HeaderValue::from_str(allow_headers) {
+        response_headers.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, value);
+    }
+    response_headers.insert(
+        header::ACCESS_CONTROL_MAX_AGE,
+        HeaderValue::from_static("600"),
     );
     response
+}
+
+fn apply_cors(headers: &mut HeaderMap, origin: Option<&str>) {
+    let Some(origin) = origin else {
+        return;
+    };
+    if let Ok(value) = HeaderValue::from_str(origin) {
+        headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, value);
+    }
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+        HeaderValue::from_static("true"),
+    );
+    add_vary(headers, "Origin");
+}
+
+fn add_vary(headers: &mut HeaderMap, token: &str) {
+    let existing = headers
+        .get(header::VARY)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if existing
+        .split(',')
+        .any(|value| value.trim().eq_ignore_ascii_case(token))
+    {
+        return;
+    }
+    let value = if existing.trim().is_empty() {
+        token.to_string()
+    } else {
+        format!("{existing}, {token}")
+    };
+    if let Ok(value) = HeaderValue::from_str(&value) {
+        headers.insert(header::VARY, value);
+    }
 }
 
 fn wants_upgrade(headers: &HeaderMap) -> bool {
@@ -408,8 +798,6 @@ fn is_normal_close(err: &std::io::Error) -> bool {
             | ErrorKind::BrokenPipe
     ) || err.to_string().contains("close_notify")
 }
-
-use axum::response::IntoResponse;
 
 fn log(src: &str, msg: &str) {
     let ts = chrono::Local::now().format("%H:%M:%S");
